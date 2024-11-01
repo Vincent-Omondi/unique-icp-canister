@@ -1,6 +1,5 @@
-// cannister code goes here
 import { v4 as uuidv4 } from 'uuid';
-import { Server, StableBTreeMap, ic, Query, Update } from 'azle';
+import { Server, StableBTreeMap, ic, query, update } from 'azle';
 import express from 'express';
 
 // Define the main types for our digital asset registry
@@ -29,7 +28,8 @@ enum AssetType {
 enum AssetStatus {
     ACTIVE = "ACTIVE",
     TRANSFERRED = "TRANSFERRED",
-    REVOKED = "REVOKED"
+    REVOKED = "REVOKED",
+    DELETED = "DELETED"
 }
 
 class Transfer {
@@ -58,6 +58,18 @@ const assetStorage = StableBTreeMap<string, DigitalAsset>(0);
 const creatorAssets = StableBTreeMap<string, string[]>(1);  // Creator ID to Asset IDs mapping
 const assetTransfers = StableBTreeMap<string, Transfer[]>(2);
 
+// Custom error class
+class AppError extends Error {
+    statusCode: number;
+    constructor(message: string, statusCode: number) {
+        super(message);
+        this.statusCode = statusCode;
+    }
+}
+
+// Rate limiter
+const rateLimiter = new Map<string, number>();
+
 export default Server(() => {
     const app = express();
     app.use(express.json());
@@ -65,6 +77,10 @@ export default Server(() => {
     // Register a new digital asset
     app.post("/assets", (req, res) => {
         try {
+            if (!rateLimit(req.body.creatorId, 10)) {
+                throw new AppError("Too many requests", 429);
+            }
+
             validateAssetRegistration(req.body);
             
             const assetId = uuidv4();
@@ -93,49 +109,71 @@ export default Server(() => {
                 creatorAssets.insert(req.body.creatorId, [...creatorAssetList.Some, assetId]);
             }
 
+            log(`Asset created: ${assetId}`, 'INFO');
             res.json(asset);
         } catch (error) {
-            res.status(400).json({ error: error.message });
+            log(`Error creating asset: ${error.message}`, 'ERROR');
+            handleError(res, error);
         }
     });
 
     // Get asset by ID
     app.get("/assets/:id", (req, res) => {
-        const assetOpt = assetStorage.get(req.params.id);
-        if ("None" in assetOpt) {
-            res.status(404).json({ error: "Asset not found" });
-        } else {
+        try {
+            const assetOpt = assetStorage.get(req.params.id);
+            if ("None" in assetOpt) {
+                throw new AppError("Asset not found", 404);
+            }
             res.json(assetOpt.Some);
+        } catch (error) {
+            handleError(res, error);
         }
     });
 
-    // Get all assets by creator ID
+    // Get all assets by creator ID (with pagination)
     app.get("/creators/:creatorId/assets", (req, res) => {
-        const creatorAssetsOpt = creatorAssets.get(req.params.creatorId);
-        if ("None" in creatorAssetsOpt) {
-            res.json([]);
-        } else {
-            const assets = creatorAssetsOpt.Some.map(assetId => {
+        try {
+            const page = parseInt(req.query.page as string) || 1;
+            const limit = parseInt(req.query.limit as string) || 10;
+            const creatorAssetsOpt = creatorAssets.get(req.params.creatorId);
+            if ("None" in creatorAssetsOpt) {
+                return res.json({ assets: [], total: 0, page, limit });
+            }
+            const allAssets = creatorAssetsOpt.Some;
+            const startIndex = (page - 1) * limit;
+            const endIndex = page * limit;
+            const paginatedAssets = allAssets.slice(startIndex, endIndex).map(assetId => {
                 const asset = assetStorage.get(assetId);
                 return "None" in asset ? null : asset.Some;
             }).filter(asset => asset !== null);
-            res.json(assets);
+            res.json({
+                assets: paginatedAssets,
+                total: allAssets.length,
+                page,
+                limit
+            });
+        } catch (error) {
+            handleError(res, error);
         }
     });
 
     // Transfer asset ownership
     app.post("/assets/:id/transfer", (req, res) => {
         try {
+            if (!isAuthorized(req.params.id, req.body.fromId)) {
+                throw new AppError("Unauthorized", 403);
+            }
+
             const { toId, transferType } = req.body;
             const assetOpt = assetStorage.get(req.params.id);
 
             if ("None" in assetOpt) {
-                throw new Error("Asset not found");
+                throw new AppError("Asset not found", 404);
             }
 
             const asset = assetOpt.Some;
             if (asset.status !== AssetStatus.ACTIVE) {
-                throw new Error("Asset is not available for transfer");
+                throw new AppError("Asset is not available for transfer", 400);
             }
 
             // Create transfer record
@@ -174,18 +212,24 @@ export default Server(() => {
             }
 
             assetStorage.insert(asset.id, updatedAsset);
+            log(`Asset transferred: ${asset.id}`, 'INFO');
             res.json(updatedAsset);
         } catch (error) {
-            res.status(400).json({ error: error.message });
+            log(`Error transferring asset: ${error.message}`, 'ERROR');
+            handleError(res, error);
         }
     });
 
     // Update asset metadata
     app.put("/assets/:id/metadata", (req, res) => {
         try {
+            if (!isAuthorized(req.params.id, req.body.creatorId)) {
+                throw new AppError("Unauthorized", 403);
+            }
+
             const assetOpt = assetStorage.get(req.params.id);
             if ("None" in assetOpt) {
-                throw new Error("Asset not found");
+                throw new AppError("Asset not found", 404);
             }
 
             const asset = assetOpt.Some;
@@ -193,29 +237,35 @@ export default Server(() => {
                 ...asset,
                 metadata: {
                     ...asset.metadata,
-                    ...req.body
+                    ...req.body.metadata
                 },
                 lastModified: getCurrentDate()
             };
 
             assetStorage.insert(asset.id, updatedAsset);
+            log(`Asset metadata updated: ${asset.id}`, 'INFO');
             res.json(updatedAsset);
         } catch (error) {
-            res.status(400).json({ error: error.message });
+            log(`Error updating asset metadata: ${error.message}`, 'ERROR');
+            handleError(res, error);
         }
     });
 
     // Revoke asset
     app.post("/assets/:id/revoke", (req, res) => {
         try {
+            if (!isAuthorized(req.params.id, req.body.creatorId)) {
+                throw new AppError("Unauthorized", 403);
+            }
+
             const assetOpt = assetStorage.get(req.params.id);
             if ("None" in assetOpt) {
-                throw new Error("Asset not found");
+                throw new AppError("Asset not found", 404);
             }
 
             const asset = assetOpt.Some;
             if (asset.status === AssetStatus.REVOKED) {
-                throw new Error("Asset is already revoked");
+                throw new AppError("Asset is already revoked", 400);
             }
 
             const updatedAsset = {
@@ -225,9 +275,39 @@ export default Server(() => {
             };
 
             assetStorage.insert(asset.id, updatedAsset);
+            log(`Asset revoked: ${asset.id}`, 'INFO');
             res.json(updatedAsset);
         } catch (error) {
-            res.status(400).json({ error: error.message });
+            log(`Error revoking asset: ${error.message}`, 'ERROR');
+            handleError(res, error);
+        }
+    });
+
+    // Soft delete asset
+    app.delete("/assets/:id", (req, res) => {
+        try {
+            if (!isAuthorized(req.params.id, req.body.creatorId)) {
+                throw new AppError("Unauthorized", 403);
+            }
+
+            const assetOpt = assetStorage.get(req.params.id);
+            if ("None" in assetOpt) {
+                throw new AppError("Asset not found", 404);
+            }
+
+            const asset = assetOpt.Some;
+            const updatedAsset = {
+                ...asset,
+                status: AssetStatus.DELETED,
+                lastModified: getCurrentDate()
+            };
+
+            assetStorage.insert(asset.id, updatedAsset);
+            log(`Asset deleted: ${asset.id}`, 'INFO');
+            res.json({ message: "Asset deleted successfully" });
+        } catch (error) {
+            log(`Error deleting asset: ${error.message}`, 'ERROR');
+            handleError(res, error);
         }
     });
 
@@ -236,24 +316,53 @@ export default Server(() => {
 
 // Utility Functions
 function getCurrentDate(): Date {
-    const timestamp = new Number(ic.time());
-    return new Date(timestamp.valueOf() / 1000_000);
+    const timestampNs = ic.time();
+    return new Date(Number(timestampNs / BigInt(1_000_000)));
 }
 
 function validateAssetRegistration(data: any): void {
-    if (!data.title || typeof data.title !== 'string') {
-        throw new Error("Invalid title");
+    if (!data.title || typeof data.title !== 'string' || data.title.length > 100) {
+        throw new AppError("Invalid title", 400);
     }
-    if (!data.creatorId || typeof data.creatorId !== 'string') {
-        throw new Error("Invalid creator ID");
+    if (!data.creatorId || typeof data.creatorId !== 'string' || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(data.creatorId)) {
+        throw new AppError("Invalid creator ID", 400);
     }
-    if (!data.contentHash || typeof data.contentHash !== 'string') {
-        throw new Error("Invalid content hash");
+    if (!data.contentHash || typeof data.contentHash !== 'string' || !/^[a-fA-F0-9]{64}$/.test(data.contentHash)) {
+        throw new AppError("Invalid content hash", 400);
     }
     if (!Object.values(AssetType).includes(data.assetType)) {
-        throw new Error("Invalid asset type");
+        throw new AppError("Invalid asset type", 400);
     }
     if (!data.metadata || typeof data.metadata !== 'object') {
-        throw new Error("Invalid metadata");
+        throw new AppError("Invalid metadata", 400);
     }
+}
+
+function isAuthorized(assetId: string, userId: string): boolean {
+    const assetOpt = assetStorage.get(assetId);
+    if ("None" in assetOpt) {
+        return false;
+    }
+    return assetOpt.Some.creatorId === userId;
+}
+
+function rateLimit(userId: string, limit: number): boolean {
+    const now = Date.now();
+    const userRequests = rateLimiter.get(userId) || 0;
+    if (userRequests >= limit) {
+        return false;
+    }
+    rateLimiter.set(userId, userRequests + 1);
+    setTimeout(() => rateLimiter.set(userId, userRequests), 60000); // Reset after 1 minute
+    return true;
+}
+
+function handleError(res: express.Response, error: any) {
+    const statusCode = error instanceof AppError ? error.statusCode : 500;
+    res.status(statusCode).json({ error: error.message });
+}
+
+function log(message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
+    const timestamp = getCurrentDate().toISOString();
+    ic.print(`[${timestamp}] [${level}] ${message}`);
 }
